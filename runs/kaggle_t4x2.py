@@ -21,8 +21,17 @@ Kaggle usage
 
 Or from a clone of the repo:
 
-    !git clone https://github.com/karpathy/nanochat.git
+    !git clone https://github.com/hbpkillerX-5257/nanochat.git
     !python nanochat/runs/kaggle_t4x2.py
+
+Enable Weights & Biases (optional):
+
+    export WANDB_API_KEY=...          # required
+    # optional: export WANDB_ENTITY=...  WANDB_PROJECT=nanochat
+    python nanochat/runs/kaggle_t4x2.py --wandb
+    python nanochat/runs/kaggle_t4x2.py --wandb --wandb-run my-kaggle-d8
+
+Without --wandb, logging stays off (same as --run=dummy).
 
 Disk budget (approx, free tier)
 -------------------------------
@@ -47,6 +56,7 @@ Tune STAGE_* / CFG below before running.
 
 from __future__ import annotations
 
+import argparse
 import os
 import shutil
 import subprocess
@@ -91,12 +101,15 @@ NPROC = 2                      # Kaggle T4 x2
 MODEL_TAG = "kaggle-d8"
 
 # Repo source
-REPO_URL = "https://github.com/karpathy/nanochat.git"
+REPO_URL = "https://github.com/hbpkillerX-5257/nanochat.git"
 REPO_DIR_NAME = "nanochat"
+
+# Wandb: set by CLI --wandb / --wandb-run (see parse_args). Defaults = off.
+USE_WANDB = False
+WANDB_RUN_NAME = MODEL_TAG  # passed as --run=... to base_train / chat_sft
 
 # Force free-tier friendly env
 os.environ.setdefault("NANOCHAT_DTYPE", "float16")  # T4 has no bf16
-os.environ.setdefault("WANDB_MODE", "disabled")
 os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
 os.environ.setdefault("OMP_NUM_THREADS", "1")
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
@@ -105,6 +118,78 @@ os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 # Abort if free disk on the cache volume falls below this (GB)
 MIN_FREE_GB = 2.0
+
+
+# =============================================================================
+# CLI / wandb
+# =============================================================================
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    p = argparse.ArgumentParser(
+        description="nanochat Kaggle 2xT4 runner",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    p.add_argument(
+        "--wandb",
+        action="store_true",
+        help="Enable Weights & Biases logging. Requires WANDB_API_KEY in the environment.",
+    )
+    p.add_argument(
+        "--wandb-run",
+        type=str,
+        default=None,
+        help="Wandb run name (and nanochat --run=...). Default: MODEL_TAG. Implies --wandb.",
+    )
+    return p.parse_args(argv)
+
+
+def configure_wandb(enable: bool, run_name: str | None) -> str:
+    """
+    Configure wandb for child training processes.
+
+    Returns the value to pass as --run= to base_train / chat_sft.
+    - disabled → "dummy" (nanochat skips wandb)
+    - enabled  → run name; reads WANDB_API_KEY from env (export WANDB_API_KEY=...)
+    """
+    global USE_WANDB, WANDB_RUN_NAME
+
+    if not enable and not run_name:
+        USE_WANDB = False
+        WANDB_RUN_NAME = "dummy"
+        # Keep offline/disabled so accidental wandb.init does nothing useful
+        os.environ["WANDB_MODE"] = "disabled"
+        print("wandb: OFF  (pass --wandb to enable; key via export WANDB_API_KEY=...)")
+        return "dummy"
+
+    USE_WANDB = True
+    WANDB_RUN_NAME = run_name or MODEL_TAG
+    if WANDB_RUN_NAME == "dummy":
+        raise SystemExit("--wandb-run cannot be 'dummy' (that name disables logging in nanochat)")
+
+    api_key = os.environ.get("WANDB_API_KEY", "").strip()
+    if not api_key:
+        raise SystemExit(
+            "wandb enabled but WANDB_API_KEY is not set.\n"
+            "  export WANDB_API_KEY=...   # from https://wandb.ai/authorize\n"
+            "  python runs/kaggle_t4x2.py --wandb"
+        )
+
+    # Clear disabled mode so wandb can actually sync.
+    # Leave WANDB_MODE=offline alone if the user set it intentionally.
+    if os.environ.get("WANDB_MODE") == "disabled":
+        del os.environ["WANDB_MODE"]
+
+    # Silence interactive prompts on Kaggle
+    os.environ.setdefault("WANDB_SILENT", "true")
+
+    entity = os.environ.get("WANDB_ENTITY", "")
+    project = os.environ.get("WANDB_PROJECT", "nanochat")
+    print(
+        f"wandb: ON  run={WANDB_RUN_NAME!r}  "
+        f"entity={entity or '(default)'}  project={project}  "
+        f"key=***{api_key[-4:]}"
+    )
+    return WANDB_RUN_NAME
 
 
 # =============================================================================
@@ -496,7 +581,7 @@ def pretrain(py: Path, repo: Path) -> None:
         "--sample-every=500",
         "--eval-every=250",
         "--eval-tokens=262144",       # smaller val eval
-        "--run=dummy",
+        f"--run={WANDB_RUN_NAME}",
     ]
     if NUM_ITERATIONS is not None:
         cmd.append(f"--num-iterations={NUM_ITERATIONS}")
@@ -513,6 +598,8 @@ def sft(py: Path, repo: Path) -> None:
     require_free(os.environ["NANOCHAT_BASE_DIR"], min_free_gb=2.0)
     nproc = min(NPROC, _cuda_count(py))
     # SFT will download SmolTalk/MMLU/GSM8K into HF cache (~1–1.5GB)
+    # Distinct run name so SFT doesn't clobber the pretrain wandb run
+    sft_run = WANDB_RUN_NAME if WANDB_RUN_NAME == "dummy" else f"{WANDB_RUN_NAME}-sft"
     cmd = _torchrun_launcher(py, nproc) + [
         "-m", "scripts.chat_sft", "--",
         f"--model-tag={MODEL_TAG}",
@@ -524,7 +611,7 @@ def sft(py: Path, repo: Path) -> None:
         "--chatcore-every=-1",
         "--eval-every=200",
         "--eval-tokens=131072",
-        "--run=dummy",
+        f"--run={sft_run}",
     ]
     run(cmd, cwd=repo)
     # prune base optim shards after SFT if present (large, not needed for chat)
@@ -608,10 +695,16 @@ def _cuda_count(py: Path) -> int:
 # Main
 # =============================================================================
 
-def main() -> None:
+def main(argv: list[str] | None = None) -> None:
+    args = parse_args(argv)
+    # --wandb-run alone also turns logging on
+    enable_wandb = bool(args.wandb or args.wandb_run)
+    configure_wandb(enable_wandb, args.wandb_run)
+
     t0 = time.time()
     print("nanochat Kaggle 2xT4 runner")
     print(f"NANOCHAT_DTYPE={os.environ.get('NANOCHAT_DTYPE')}")
+    print(f"wandb enabled={USE_WANDB}  --run={WANDB_RUN_NAME}")
 
     work_root = pick_work_root()
     cache_root = pick_cache_root()
