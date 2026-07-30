@@ -144,12 +144,22 @@ class MLP(nn.Module):
 class Block(nn.Module):
     def __init__(self, config, layer_idx):
         super().__init__()
-        self.attn = CausalSelfAttention(config, layer_idx)
+        self.layer_idx = layer_idx
+        # Experiment: layer 0 has no multi-head attention and no residual connections.
+        # Later layers keep the standard Pre-LN residual transformer block.
+        self.skip_attn = (layer_idx == 0)
+        self.no_residual = (layer_idx == 0)
+        self.attn = None if self.skip_attn else CausalSelfAttention(config, layer_idx)
         self.mlp = MLP(config)
 
     def forward(self, x, ve, cos_sin, window_size, kv_cache):
-        x = x + self.attn(norm(x), ve, cos_sin, window_size, kv_cache)
-        x = x + self.mlp(norm(x))
+        # Attention sub-block (skipped on layer 0)
+        if self.attn is not None:
+            attn_out = self.attn(norm(x), ve, cos_sin, window_size, kv_cache)
+            x = attn_out if self.no_residual else x + attn_out
+        # MLP sub-block
+        mlp_out = self.mlp(norm(x))
+        x = mlp_out if self.no_residual else x + mlp_out
         return x
 
 
@@ -174,6 +184,7 @@ class GPT(nn.Module):
             "wte": nn.Embedding(padded_vocab_size, config.n_embd),
             "h": nn.ModuleList([Block(config, layer_idx) for layer_idx in range(config.n_layer)]),
         })
+        print0("Experiment: layer 0 has no attention and no residual connections (MLP-only, no skip)")
         self.lm_head = Linear(config.n_embd, padded_vocab_size, bias=False)
         # Per-layer learnable scalars (inspired by modded-nanogpt)
         # resid_lambdas: scales the residual stream at each layer (init 1.0 = neutral)
@@ -186,10 +197,15 @@ class GPT(nn.Module):
         self.smear_lambda = nn.Parameter(torch.zeros(1))
         # Backout: subtract cached mid-layer residual before final norm to remove low-level features
         self.backout_lambda = nn.Parameter(0.2 * torch.ones(1))
-        # Value embeddings (ResFormer-style): alternating layers, last layer always included
+        # Value embeddings (ResFormer-style): alternating layers, last layer always included.
+        # Layer 0 has no attention in this experiment, so never attach a value embed there.
         head_dim = config.n_embd // config.n_head
         kv_dim = config.n_kv_head * head_dim
-        self.value_embeds = nn.ModuleDict({str(i): nn.Embedding(padded_vocab_size, kv_dim) for i in range(config.n_layer) if has_ve(i, config.n_layer)})
+        self.value_embeds = nn.ModuleDict({
+            str(i): nn.Embedding(padded_vocab_size, kv_dim)
+            for i in range(config.n_layer)
+            if i != 0 and has_ve(i, config.n_layer)
+        })
         # To support meta device initialization, we init the rotary embeddings here, but it's just "fake" meta tensors only.
         # As for rotary_seq_len, these rotary embeddings are pretty small/cheap in memory,
         # so let's just over-compute them by 10X, but assert fail if we ever reach that amount.
@@ -224,10 +240,11 @@ class GPT(nn.Module):
         n_embd = self.config.n_embd
         s = 3**0.5 * n_embd**-0.5 # sqrt(3) multiplier makes sure Uniform achieves the same std as Normal
         for block in self.transformer.h:
-            torch.nn.init.uniform_(block.attn.c_q.weight, -s, s) # weights use Uniform to avoid outliers
-            torch.nn.init.uniform_(block.attn.c_k.weight, -s, s)
-            torch.nn.init.uniform_(block.attn.c_v.weight, -s, s)
-            torch.nn.init.zeros_(block.attn.c_proj.weight) # projections are zero
+            if block.attn is not None:
+                torch.nn.init.uniform_(block.attn.c_q.weight, -s, s) # weights use Uniform to avoid outliers
+                torch.nn.init.uniform_(block.attn.c_k.weight, -s, s)
+                torch.nn.init.uniform_(block.attn.c_v.weight, -s, s)
+                torch.nn.init.zeros_(block.attn.c_proj.weight) # projections are zero
             torch.nn.init.uniform_(block.mlp.c_fc.weight, -s * 0.4, s * 0.4)  # 0.4x init scale for c_fc
             torch.nn.init.zeros_(block.mlp.c_proj.weight)
 
@@ -251,7 +268,7 @@ class GPT(nn.Module):
 
         # Gate weights init with small positive values so gates start slightly above neutral
         for block in self.transformer.h:
-            if block.attn.ve_gate is not None:
+            if block.attn is not None and block.attn.ve_gate is not None:
                 torch.nn.init.uniform_(block.attn.ve_gate.weight, 0.0, 0.02)
 
         # Rotary embeddings
@@ -329,9 +346,12 @@ class GPT(nn.Module):
         - Chinchilla counts exp/sum/divide in attention softmax as flops (a little sus and very tiny => we ignore)
         """
         h, q, t = self.config.n_head, self.config.n_embd // self.config.n_head, self.config.sequence_len
-        # Sum attention FLOPs per layer, accounting for sliding window
+        # Sum attention FLOPs per layer, accounting for sliding window.
+        # Layer 0 has no attention in this experiment, so skip its window.
         attn_flops = 0
-        for window_size in self.window_sizes:
+        for layer_idx, window_size in enumerate(self.window_sizes):
+            if layer_idx == 0:
+                continue
             window = window_size[0]  # (left, right) tuple, we use left
             effective_seq = t if window < 0 else min(window, t)
             attn_flops += 12 * h * q * effective_seq
@@ -355,7 +375,12 @@ class GPT(nn.Module):
         """
         h = self.config.n_head
         q = self.config.n_embd // self.config.n_head
-        attn_flops = sum(4 * h * q * min(context_len, window) for window, _ in self.window_sizes)
+        # Layer 0 has no attention → no KV read/write for that layer
+        attn_flops = sum(
+            4 * h * q * min(context_len, window)
+            for layer_idx, (window, _) in enumerate(self.window_sizes)
+            if layer_idx != 0
+        )
         decode_flops = 2 * self.num_matmul_params() + attn_flops
         return decode_flops
 
@@ -364,7 +389,9 @@ class GPT(nn.Module):
         h = self.config.n_head
         q = self.config.n_embd // self.config.n_head
         attn_flops = 0
-        for window, _ in self.window_sizes:
+        for layer_idx, (window, _) in enumerate(self.window_sizes):
+            if layer_idx == 0:
+                continue  # layer 0 has no attention
             w = min(window, num_tokens)
             attended_tokens = w * (w + 1) // 2 + (num_tokens - w) * w # ramp up to w, then flat
             attn_flops += 4 * h * q * attended_tokens
@@ -375,7 +402,9 @@ class GPT(nn.Module):
         """Bytes to *store* one token of KV cache during inference, per row (all layers)."""
         head_dim = self.config.n_embd // self.config.n_head
         kv_dtype_bytes = COMPUTE_DTYPE.itemsize # the KV cache is kept in the compute dtype
-        return self.config.n_layer * 2 * self.config.n_kv_head * head_dim * kv_dtype_bytes
+        # Layer 0 has no attention, so only (n_layer - 1) layers store KV (min 0)
+        n_attn_layers = max(self.config.n_layer - 1, 0)
+        return n_attn_layers * 2 * self.config.n_kv_head * head_dim * kv_dtype_bytes
 
     def kv_read_bytes(self, context_len):
         """Bytes of KV cache *read* by one decode step at a given context length, per row.
@@ -383,7 +412,9 @@ class GPT(nn.Module):
         head_dim = self.config.n_embd // self.config.n_head
         kv_dtype_bytes = COMPUTE_DTYPE.itemsize
         total = 0
-        for window, _ in self.window_sizes:
+        for layer_idx, (window, _) in enumerate(self.window_sizes):
+            if layer_idx == 0:
+                continue  # layer 0 has no attention
             total += 2 * self.config.n_kv_head * head_dim * kv_dtype_bytes * min(context_len, window)
         return total
 
