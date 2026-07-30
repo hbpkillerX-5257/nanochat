@@ -248,35 +248,135 @@ def ensure_repo(work_root: Path) -> Path:
     return repo
 
 
-def install_deps(repo: Path, cache_root: Path) -> Path:
-    """
-    Create a venv under the large cache volume and install deps.
-    Prefer uv if available; otherwise pip.
-    """
-    venv = cache_root / "venv"
-    py = venv / "bin" / "python"
-    pip = venv / "bin" / "pip"
-
-    if not py.exists():
-        print(f"Creating venv at {venv}")
-        run([sys.executable, "-m", "venv", str(venv)])
-
-    # Upgrade packaging tools (small)
-    run([str(py), "-m", "pip", "install", "-U", "pip", "setuptools", "wheel"])
-
-    # Install project. On Kaggle, torch is often preinstalled; still pull the
-    # version nanochat expects if needed. Use GPU wheel index for CUDA builds.
-    # To save disk we install without dev group.
-    require_free(cache_root, min_free_gb=4.0)
-
-    # Detect if current venv already has a usable torch+cuda
-    has_torch = subprocess.run(
-        [str(py), "-c", "import torch; print(torch.__version__, torch.cuda.is_available())"],
+def _probe_torch(py: str | Path) -> tuple[bool, str]:
+    r = subprocess.run(
+        [str(py), "-c", "import torch; print(torch.__version__); print(torch.cuda.is_available()); print(torch.cuda.device_count())"],
         capture_output=True, text=True,
     )
-    print("torch probe:", has_torch.stdout.strip() or has_torch.stderr.strip())
+    out = (r.stdout or r.stderr or "").strip()
+    ok = r.returncode == 0 and "True" in out
+    return ok, out
 
-    # Lightweight deps first (avoid pulling a second torch if possible)
+
+def _bootstrap_pip(py: Path) -> None:
+    """Install pip into a venv created with --without-pip (common on Kaggle)."""
+    # Already have pip?
+    r = subprocess.run([str(py), "-m", "pip", "--version"], capture_output=True, text=True)
+    if r.returncode == 0:
+        return
+    get_pip = Path("/tmp/get-pip.py")
+    print("Bootstrapping pip via get-pip.py …")
+    run(["curl", "-fsSL", "https://bootstrap.pypa.io/get-pip.py", "-o", str(get_pip)])
+    run([str(py), str(get_pip)])
+    get_pip.unlink(missing_ok=True)
+
+
+def _create_venv(venv: Path) -> Path:
+    """
+    Create a venv robustly. Kaggle's system Python often lacks ensurepip, so
+    `python -m venv` fails — fall through several strategies.
+    Returns path to the venv python.
+    """
+    py = venv / "bin" / "python"
+    if py.exists():
+        print(f"Reusing existing venv at {venv}")
+        _bootstrap_pip(py)
+        return py
+
+    # 1) uv (best if we can install it)
+    uv_bin = which("uv")
+    if uv_bin is None:
+        uv_candidate = venv.parent / "bin" / "uv"
+        if not uv_candidate.exists():
+            print("Trying to install uv into cache …")
+            try:
+                env = os.environ.copy()
+                env["UV_INSTALL_DIR"] = str(venv.parent / "bin")
+                # official standalone installer
+                subprocess.run(
+                    "curl -fsSL https://astral.sh/uv/install.sh | sh",
+                    shell=True, check=True, env=env,
+                )
+            except Exception as e:
+                print(f"  uv install skipped: {e}")
+        # install.sh puts uv in ~/.local/bin or UV_INSTALL_DIR
+        for cand in (
+            venv.parent / "bin" / "uv",
+            Path.home() / ".local" / "bin" / "uv",
+            Path.home() / ".cargo" / "bin" / "uv",
+        ):
+            if cand.exists():
+                uv_bin = str(cand)
+                break
+        if uv_bin is None:
+            uv_bin = which("uv")
+
+    if uv_bin:
+        print(f"Creating venv with uv ({uv_bin}) at {venv}")
+        run([uv_bin, "venv", str(venv), "--python", sys.executable])
+        if py.exists():
+            return py
+
+    # 2) stdlib venv (may fail on Kaggle without ensurepip)
+    print(f"Creating venv at {venv}")
+    r = subprocess.run([sys.executable, "-m", "venv", str(venv)], capture_output=True, text=True)
+    if r.returncode == 0 and py.exists():
+        _bootstrap_pip(py)
+        return py
+    print(f"  plain venv failed: {(r.stderr or r.stdout or '').strip()[:400]}")
+
+    # 3) venv --without-pip + get-pip.py
+    if venv.exists():
+        shutil.rmtree(venv, ignore_errors=True)
+    print(f"Retrying venv --without-pip at {venv}")
+    r = subprocess.run(
+        [sys.executable, "-m", "venv", "--without-pip", str(venv)],
+        capture_output=True, text=True,
+    )
+    if r.returncode == 0 and py.exists():
+        _bootstrap_pip(py)
+        return py
+    print(f"  venv --without-pip failed: {(r.stderr or r.stdout or '').strip()[:400]}")
+
+    # 4) virtualenv package via system pip (if available)
+    if venv.exists():
+        shutil.rmtree(venv, ignore_errors=True)
+    print("Trying virtualenv module …")
+    subprocess.run([sys.executable, "-m", "pip", "install", "--user", "virtualenv", "-q"], check=False)
+    r = subprocess.run(
+        [sys.executable, "-m", "virtualenv", str(venv)],
+        capture_output=True, text=True,
+    )
+    if r.returncode == 0 and py.exists():
+        return py
+    print(f"  virtualenv failed: {(r.stderr or r.stdout or '').strip()[:400]}")
+
+    raise RuntimeError(
+        "Could not create a virtualenv on this image. "
+        "Will fall back to system Python + --target site-packages."
+    )
+
+
+def _pip_install(py: Path, args: list[str], cwd: Path | None = None, target: Path | None = None) -> None:
+    cmd = [str(py), "-m", "pip", "install"]
+    if target is not None:
+        cmd += ["--target", str(target), "--upgrade"]
+    cmd += args
+    run(cmd, cwd=cwd)
+
+
+def install_deps(repo: Path, cache_root: Path) -> Path:
+    """
+    Install deps and return the Python executable to use for training.
+
+    Strategy (Kaggle-friendly):
+    1) Prefer a venv under the large cache volume
+    2) If venv creation fails (no ensurepip), use system Python + packages
+       installed into cache_root/pydeps via pip --target (reuses Kaggle's
+       preinstalled CUDA torch — best for disk + GPU)
+    """
+    require_free(cache_root, min_free_gb=3.0)
+
     light = [
         "filelock>=3.19.0",
         "numpy>=1.26.0",
@@ -288,37 +388,83 @@ def install_deps(repo: Path, cache_root: Path) -> Path:
         "requests",
         "kernels>=0.11.7",
     ]
-    run([str(pip), "install", *light], cwd=repo)
 
-    # Torch: install only if missing / no CUDA
-    need_torch = True
-    if has_torch.returncode == 0 and "True" in (has_torch.stdout or ""):
-        need_torch = False
-        print("Reusing existing CUDA torch in venv")
-    if need_torch:
-        # Kaggle T4 is CUDA 12.x class; cu121/cu124 wheels both usually work.
-        # Prefer the pytorch cu124 index (widely available); fall back to default.
+    py: Path | None = None
+    target: Path | None = None  # set when using --target install mode
+    mode = "venv"
+
+    try:
+        venv = cache_root / "venv"
+        py = _create_venv(venv)
+        print(f"Using venv python: {py}")
+        run([str(py), "-m", "pip", "install", "-U", "pip", "setuptools", "wheel"])
+    except Exception as e:
+        print(f"Venv path unavailable ({e}); falling back to system Python + --target")
+        mode = "target"
+        py = Path(sys.executable)
+        target = cache_root / "pydeps"
+        target.mkdir(parents=True, exist_ok=True)
+        # Ensure pip exists on system python
+        r = subprocess.run([str(py), "-m", "pip", "--version"], capture_output=True, text=True)
+        if r.returncode != 0:
+            _bootstrap_pip(py)
+        # Put target packages first on path for this process and children
+        os.environ["PYTHONPATH"] = str(target) + os.pathsep + os.environ.get("PYTHONPATH", "")
+        print(f"Using system python: {py}")
+        print(f"Extra packages target: {target}")
+
+    assert py is not None
+
+    # Torch: reuse if CUDA already works (Kaggle images usually have this)
+    ok, probe = _probe_torch(py)
+    # When using --target, system torch is still importable from site-packages
+    if mode == "target":
+        ok, probe = _probe_torch(py)
+    print("torch probe:", probe.replace("\n", " | "))
+
+    _pip_install(py, light, cwd=repo, target=target)
+
+    if not ok:
         print("Installing torch (CUDA) — this is the big disk hit…")
         require_free(cache_root, min_free_gb=5.0)
+        torch_args = ["torch==2.6.0", "--index-url", "https://download.pytorch.org/whl/cu124"]
         try:
-            run([
-                str(pip), "install",
-                "torch==2.6.0",  # slightly older = often already cached on Kaggle mirrors
-                "--index-url", "https://download.pytorch.org/whl/cu124",
-            ])
+            _pip_install(py, torch_args, target=target)
         except SystemExit:
             print("cu124 install failed; trying default PyPI torch…")
-            run([str(pip), "install", "torch"])
+            _pip_install(py, ["torch"], target=target)
+    else:
+        print("Reusing existing CUDA-capable torch (no reinstall)")
 
-    # Install nanochat package itself (no-deps — we already installed them)
-    run([str(pip), "install", "-e", ".", "--no-deps"], cwd=repo)
+    # Install nanochat editable when in a real venv; otherwise rely on PYTHONPATH=repo
+    if mode == "venv":
+        _pip_install(py, ["-e", ".", "--no-deps"], cwd=repo)
+    else:
+        # editable install into --target is flaky; put repo on PYTHONPATH instead
+        os.environ["PYTHONPATH"] = (
+            str(repo) + os.pathsep + str(target) + os.pathsep + os.environ.get("PYTHONPATH", "")
+        )
+        # drop a .pth so torchrun child processes find packages even if env is stripped
+        pth = target / "nanochat_kaggle.pth"
+        pth.write_text(f"{repo}\n{target}\n")
+        print(f"Wrote path file {pth}")
 
     # Sanity
+    env = os.environ.copy()
+    if mode == "target" and target is not None:
+        env["PYTHONPATH"] = str(repo) + os.pathsep + str(target) + os.pathsep + env.get("PYTHONPATH", "")
     run([str(py), "-c",
          "import torch; print('torch', torch.__version__, 'cuda', torch.cuda.is_available(), "
          "'gpus', torch.cuda.device_count()); "
-         "import nanochat; print('nanochat ok')"])
-    return venv
+         "import nanochat; print('nanochat ok')"],
+        env=env)
+
+    # Persist resolver hint for STAGE_INSTALL=False restarts
+    meta = cache_root / "python_path.txt"
+    meta.write_text(str(py.resolve()) + "\n")
+    if mode == "target" and target is not None:
+        (cache_root / "pydeps_path.txt").write_text(str(target.resolve()) + "\n")
+    return py
 
 
 # =============================================================================
@@ -517,15 +663,26 @@ def main() -> None:
     repo = ensure_repo(work_root)
 
     if STAGE_INSTALL:
-        venv = install_deps(repo, cache_root)
+        py = install_deps(repo, cache_root)
     else:
-        venv = cache_root / "venv"
-        if not (venv / "bin" / "python").exists():
-            raise SystemExit("STAGE_INSTALL=False but venv missing — set STAGE_INSTALL=True once")
+        # Resolve python from a previous install
+        hint = cache_root / "python_path.txt"
+        venv_py = cache_root / "venv" / "bin" / "python"
+        if hint.exists():
+            py = Path(hint.read_text().strip())
+        elif venv_py.exists():
+            py = venv_py
+        else:
+            raise SystemExit("STAGE_INSTALL=False but no previous python found — set STAGE_INSTALL=True once")
+        pydeps = cache_root / "pydeps"
+        if pydeps.is_dir():
+            os.environ["PYTHONPATH"] = (
+                str(repo) + os.pathsep + str(pydeps) + os.pathsep + os.environ.get("PYTHONPATH", "")
+            )
 
-    py = venv / "bin" / "python"
-    # Make sure scripts resolve package imports from repo
+    # Make sure scripts resolve package imports from repo (always)
     os.environ["PYTHONPATH"] = str(repo) + os.pathsep + os.environ.get("PYTHONPATH", "")
+    print(f"Training python: {py}")
 
     report_disk("after install", [cache_root, work_root])
 
