@@ -422,8 +422,19 @@ while True:
     # evaluate the gradient
     synchronize()
     t0 = time.time()
+    skip_step = False
+    train_loss = None
     for micro_step in range(grad_accum_steps):
         loss = model(x, y)
+        # All-ignore (pad-only) batches yield NaN CE; high LR/fp16 can also explode.
+        if not torch.isfinite(loss):
+            print0(f"WARNING: non-finite loss at step {step} micro={micro_step} — skipping optimizer step")
+            skip_step = True
+            model.zero_grad(set_to_none=True)
+            # still advance the loader so we don't stick on a bad batch forever
+            x, y = next(train_loader)
+            progress = max(progress, approx_progress)
+            break
         train_loss = loss.detach() # for logging
         loss = loss / grad_accum_steps # each .backward() is a grad sum => normalize loss here
         if scaler is not None:
@@ -439,15 +450,23 @@ while True:
         group["lr"] = group["initial_lr"] * lrm
         if group['kind'] == 'muon':
             group["momentum"] = muon_momentum
-    if scaler is not None:
-        scaler.unscale_(optimizer)
-        if is_ddp_initialized():
-            for v in scaler._found_inf_per_device(optimizer).values():
-                dist.all_reduce(v, op=dist.ReduceOp.MAX)
-        scaler.step(optimizer)
-        scaler.update()
+    if not skip_step:
+        if scaler is not None:
+            scaler.unscale_(optimizer)
+            # Grad clip after unscale helps fp16 SFT stability
+            torch.nn.utils.clip_grad_norm_(orig_model.parameters(), 1.0)
+            if is_ddp_initialized():
+                for v in scaler._found_inf_per_device(optimizer).values():
+                    dist.all_reduce(v, op=dist.ReduceOp.MAX)
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            torch.nn.utils.clip_grad_norm_(orig_model.parameters(), 1.0)
+            optimizer.step()
     else:
-        optimizer.step()
+        # Keep GradScaler state consistent when we skip a step
+        if scaler is not None:
+            scaler.update()
     model.zero_grad(set_to_none=True)
     synchronize()
     t1 = time.time()
@@ -458,7 +477,8 @@ while True:
     step += 1
 
     # logging
-    smooth_train_loss = ema_beta * smooth_train_loss + (1 - ema_beta) * train_loss.item() # EMA the training loss
+    if train_loss is not None and torch.isfinite(train_loss):
+        smooth_train_loss = ema_beta * smooth_train_loss + (1 - ema_beta) * train_loss.item() # EMA the training loss
     debiased_smooth_loss = smooth_train_loss / (1 - ema_beta**(step + 1)) # debias the EMA
     pct_done = 100 * progress
     tok_per_sec = int(args.total_batch_size / dt)

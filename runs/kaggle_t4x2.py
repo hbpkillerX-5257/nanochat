@@ -38,12 +38,12 @@ Disk budget (approx, free tier)
 /kaggle/working is ~20GB and is the only durable output dir.
 Large temps go under /kaggle/tmp or /tmp (ephemeral, usually larger).
 
-Typical usage with defaults:
-  ClimbMix 6 train + 1 val shards  ~ 0.7 GB
+Typical usage with defaults (~5–8h pretrain on 2xT4):
+  ClimbMix 40 train + 1 val shards ~ 3.8 GB
   SFT hub cache (smoltalk+mmlu+gsm8k) ~ 1.0–1.5 GB
   d8 checkpoints (final only)      ~ 1–2 GB
   missing pip wheels only          ~ 0.1–0.5 GB (reuses Kaggle torch)
-  TOTAL                             well under /kaggle/working 20GB
+  TOTAL                             kept under /tmp (large); export stays small
 
 Install policy (important on Kaggle):
   - Uses the *system* Python (preinstalled CUDA torch) — no fresh venv
@@ -78,23 +78,34 @@ STAGE_CHAT_SMOKE = True  # one-shot CLI prompt after SFT (or base if SFT off)
 STAGE_EXPORT = True      # copy final artifacts into /kaggle/working
 
 # Model / training (2x T4 safe defaults)
+# ~20–25 min was ~1500 steps on 2xT4. Target ~5–8h ⇒ ~18k–30k steps.
+# 22000 steps × ~1.0–1.2s/step ≈ 6–7.5h wall-clock (SDPA, varies by session).
 DEPTH = 8
 MAX_SEQ_LEN = 1024
 DEVICE_BATCH_SIZE = 4          # drop to 2 or 1 if OOM
 TOTAL_BATCH_SIZE = 65536       # must be multiple of device_batch * seq * n_gpus
-NUM_ITERATIONS = 1500          # time-box pretrain; raise if you have hours left
+NUM_ITERATIONS = 22000         # ~5–8h pretrain on free Kaggle 2xT4
 # If NUM_ITERATIONS is None, uses TARGET_PARAM_DATA_RATIO instead
-TARGET_PARAM_DATA_RATIO = 4.0  # default nanochat is ~12; lower = shorter run
+TARGET_PARAM_DATA_RATIO = 4.0  # unused when NUM_ITERATIONS is set
 
-# Tokenizer
-TOK_MAX_CHARS = 500_000_000    # 0.5B chars (default repo uses 2B)
-NUM_CLIMBMIX_SHARDS = 6        # each ~92MB; +1 val shard always
+# Tokenizer + pretrain data
+# 22000 * 65536 ≈ 1.44B tokens ⇒ need more ClimbMix than the old 6-shard demo.
+TOK_MAX_CHARS = 2_000_000_000  # 2B chars for a decent tokenizer
+NUM_CLIMBMIX_SHARDS = 40       # ~40*92MB ≈ 3.7GB (+val); fits under /tmp
 
 # SFT (only if STAGE_SFT)
-SFT_NUM_ITERATIONS = 400       # short; full SmolTalk epoch is huge
+# Keep SFT short relative to pretrain; lower LRs than pretrain (see sft() args).
+SFT_NUM_ITERATIONS = 800
 SFT_DEVICE_BATCH_SIZE = 2
+SFT_TOTAL_BATCH_SIZE = 16384   # smaller than pretrain → stabler fp16 SFT
 SFT_MMLU_EPOCHS = 1
 SFT_GSM8K_EPOCHS = 1
+# Explicit SFT LRs — do NOT inherit pretrain embedding_lr=0.3 (that NaNs fp16 SFT)
+SFT_EMBEDDING_LR = 0.02
+SFT_UNEMBEDDING_LR = 0.004
+SFT_MATRIX_LR = 0.005
+SFT_INIT_LR_FRAC = 0.25
+SFT_WARMUP_RATIO = 0.05
 
 # Multi-GPU
 NPROC = 2                      # Kaggle T4 x2
@@ -535,7 +546,8 @@ def install_deps(repo: Path, cache_root: Path) -> Path:
 # =============================================================================
 
 def download_climbmix(py: Path, n_shards: int) -> None:
-    require_free(os.environ["NANOCHAT_BASE_DIR"], min_free_gb=2.0)
+    # ~0.092 GB/shard + val + headroom
+    require_free(os.environ["NANOCHAT_BASE_DIR"], min_free_gb=max(4.0, n_shards * 0.1 + 1.0))
     # dataset module always also fetches the val shard (last id)
     run([str(py), "-m", "nanochat.dataset", "-n", str(n_shards), "-w", "2"])
     data_dir = Path(os.environ["NANOCHAT_BASE_DIR"]) / "base_data_climbmix"
@@ -600,13 +612,28 @@ def sft(py: Path, repo: Path) -> None:
     # SFT will download SmolTalk/MMLU/GSM8K into HF cache (~1–1.5GB)
     # Distinct run name so SFT doesn't clobber the pretrain wandb run
     sft_run = WANDB_RUN_NAME if WANDB_RUN_NAME == "dummy" else f"{WANDB_RUN_NAME}-sft"
+    # world_tokens must divide total_batch_size
+    world_tokens = SFT_DEVICE_BATCH_SIZE * MAX_SEQ_LEN * nproc
+    sft_total_bs = SFT_TOTAL_BATCH_SIZE
+    if sft_total_bs % world_tokens != 0:
+        # snap down to nearest valid multiple
+        sft_total_bs = max(world_tokens, (sft_total_bs // world_tokens) * world_tokens)
+        print(f"Adjusted SFT total_batch_size → {sft_total_bs}")
     cmd = _torchrun_launcher(py, nproc) + [
         "-m", "scripts.chat_sft", "--",
         f"--model-tag={MODEL_TAG}",
         f"--device-batch-size={SFT_DEVICE_BATCH_SIZE}",
+        f"--total-batch-size={sft_total_bs}",
+        f"--max-seq-len={MAX_SEQ_LEN}",
         f"--num-iterations={SFT_NUM_ITERATIONS}",
         f"--mmlu-epochs={SFT_MMLU_EPOCHS}",
         f"--gsm8k-epochs={SFT_GSM8K_EPOCHS}",
+        # Lower LRs for SFT (pretrain LRs, especially emb=0.3, explode in fp16)
+        f"--embedding-lr={SFT_EMBEDDING_LR}",
+        f"--unembedding-lr={SFT_UNEMBEDDING_LR}",
+        f"--matrix-lr={SFT_MATRIX_LR}",
+        f"--init-lr-frac={SFT_INIT_LR_FRAC}",
+        f"--warmup-ratio={SFT_WARMUP_RATIO}",
         "--load-optimizer=0",          # skip loading big optim states from base
         "--chatcore-every=-1",
         "--eval-every=200",
